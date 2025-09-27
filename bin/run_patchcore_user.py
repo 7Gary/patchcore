@@ -11,6 +11,7 @@ import patchcore.common
 import patchcore.metrics
 import patchcore.patchcore
 import patchcore.sampler
+import patchcore.pseudo
 import patchcore.utils
 
 
@@ -192,10 +193,64 @@ def run(
             tpr = imagewise_metrics["tpr"]
             thresholds = imagewise_metrics["threshold"]
 
-            # 找到最佳阈值（Youden's J statistic）
-            youden_index = tpr - fpr
-            best_idx = np.argmax(youden_index)
-            best_threshold = thresholds[best_idx]
+            target_overkill = None
+            target_miss = None
+            calibration_threshold = None
+            if PatchCore_list:
+                target_overkill = getattr(
+                    PatchCore_list[0], "target_false_positive", None
+                )
+                target_miss = getattr(PatchCore_list[0], "target_miss_rate", None)
+                calibration_thresholds = [
+                    pc.calibrated_threshold
+                    for pc in PatchCore_list
+                    if getattr(pc, "calibrated_threshold", None) is not None
+                ]
+                if calibration_thresholds:
+                    calibration_threshold = float(np.median(calibration_thresholds))
+
+            def _select_threshold_with_constraints(
+                fpr_values, tpr_values, threshold_values, target_fp, target_miss_rate
+            ):
+                youden_index = tpr_values - fpr_values
+                default_idx = int(np.argmax(youden_index))
+
+                candidate_mask = np.ones_like(fpr_values, dtype=bool)
+                if target_fp is not None:
+                    candidate_mask &= fpr_values <= target_fp
+                if target_miss_rate is not None:
+                    candidate_mask &= (1.0 - tpr_values) <= target_miss_rate
+
+                if np.any(candidate_mask):
+                    constrained_idxs = np.where(candidate_mask)[0]
+                    constrained_scores = youden_index[constrained_idxs]
+                    constrained_idx = int(constrained_idxs[np.argmax(constrained_scores)])
+                    return threshold_values[constrained_idx]
+
+                if target_fp is not None:
+                    fp_mask = fpr_values <= target_fp
+                    if np.any(fp_mask):
+                        idx = int(np.argmax(tpr_values[fp_mask]))
+                        return threshold_values[fp_mask][idx]
+
+                if target_miss_rate is not None:
+                    miss_mask = (1.0 - tpr_values) <= target_miss_rate
+                    if np.any(miss_mask):
+                        idx = int(np.argmin(fpr_values[miss_mask]))
+                        return threshold_values[miss_mask][idx]
+
+                return threshold_values[default_idx]
+
+            best_threshold = _select_threshold_with_constraints(
+                fpr, tpr, thresholds, target_overkill, target_miss
+            )
+
+            if calibration_threshold is not None:
+                LOGGER.info(
+                    "Applying pseudo anomaly calibrated minimum threshold %.4f.",
+                    calibration_threshold,
+                )
+                best_threshold = max(best_threshold, calibration_threshold)
 
             # 使用最佳阈值进行预测
             y_pred = (scores >= best_threshold).astype(int)
@@ -305,6 +360,19 @@ def run(
 # NN on GPU.
 @click.option("--faiss_on_gpu", is_flag=True)
 @click.option("--faiss_num_workers", type=int, default=8)
+@click.option("--contamination_ratio", type=float, default=0.05, show_default=True)
+@click.option("--contamination_topk_ratio", type=float, default=0.1, show_default=True)
+@click.option("--target_overkill", type=float, default=0.05, show_default=True)
+@click.option("--target_miss", type=float, default=0.05, show_default=True)
+@click.option(
+    "--pseudo_generator",
+    type=click.Choice(["none", "cutpaste"]),
+    default="cutpaste",
+    show_default=True,
+)
+@click.option("--pseudo_calibration_batches", type=int, default=4, show_default=True)
+@click.option("--pseudo_samples_per_image", type=int, default=1, show_default=True)
+@click.option("--pseudo_lower_percentile", type=float, default=0.1, show_default=True)
 def patch_core(
     backbone_names,
     layers_to_extract_from,
@@ -319,6 +387,14 @@ def patch_core(
     patchsize_aggregate,
     faiss_on_gpu,
     faiss_num_workers,
+    contamination_ratio,
+    contamination_topk_ratio,
+    target_overkill,
+    target_miss,
+    pseudo_generator,
+    pseudo_calibration_batches,
+    pseudo_samples_per_image,
+    pseudo_lower_percentile,
 ):
     backbone_names = list(backbone_names)
     if len(backbone_names) > 1:
@@ -332,6 +408,9 @@ def patch_core(
 
     def get_patchcore(input_shape, sampler, device):
         loaded_patchcores = []
+        pseudo_generator_instance = None
+        if pseudo_generator == "cutpaste":
+            pseudo_generator_instance = patchcore.pseudo.CutPasteGenerator()
         for backbone_name, layers_to_extract_from in zip(
             backbone_names, layers_to_extract_from_coll
         ):
@@ -357,6 +436,14 @@ def patch_core(
                 featuresampler=sampler,
                 anomaly_scorer_num_nn=anomaly_scorer_num_nn,
                 nn_method=nn_method,
+                contamination_ratio=contamination_ratio,
+                contamination_topk_ratio=contamination_topk_ratio,
+                target_false_positive=target_overkill,
+                target_miss_rate=target_miss,
+                pseudo_anomaly_generator=pseudo_generator_instance,
+                pseudo_calibration_max_batches=pseudo_calibration_batches,
+                pseudo_samples_per_image=pseudo_samples_per_image,
+                pseudo_lower_percentile=pseudo_lower_percentile,
             )
             loaded_patchcores.append(patchcore_instance)
         return loaded_patchcores
