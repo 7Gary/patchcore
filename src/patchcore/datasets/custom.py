@@ -1,15 +1,12 @@
+"""Custom dataset utilities tailored to textile inspection."""
+
 import os
 from enum import Enum
+from typing import List, Optional, Tuple
 
 import PIL
 import torch
 from torchvision import transforms
-
-# 自定义数据集类名（根据您的实际数据集修改）
-_CUSTOM_CLASSNAMES = [
-    "bupi",
-    # 添加您的自定义类别
-]
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -22,78 +19,107 @@ class DatasetSplit(Enum):
 
 
 class CustomDataset(torch.utils.data.Dataset):
-    """
-    PyTorch Dataset for custom datasets without ground truth masks.
+    """Dataset abstraction for custom industrial inspection datasets.
+
+    The dataset assumes the following directory structure::
+
+        root/class_name/{train,val,test}/anomaly_type/*.png
+
+    Each training image is split into two tiles (left/right) which mirrors
+    the structure of the provided baseline code. During testing the same split
+    is used and optional ground-truth masks can be provided via the fourth
+    element of ``data_to_iterate``.
     """
 
     def __init__(
-            self,
-            source,
-            classname,
-            resize=256,
-            imagesize=224,
-            split=DatasetSplit.TRAIN,
-            train_val_split=1.0,
-            **kwargs,
-    ):
-        """
-        Args:
-            source: [str]. Path to the custom data folder.
-            classname: [str or None]. Name of class that should be
-                       provided in this dataset. If None, the datasets
-                       iterates over all available classes.
-            resize: [int]. (Square) Size the loaded image initially gets
-                    resized to.
-            imagesize: [int]. (Square) Size the resized loaded image gets
-                       (center-)cropped to.
-            split: [enum-option]. Indicates if training or test split of the
-                   data should be used.
-        """
+        self,
+        source: str,
+        classname: Optional[str],
+        resize: int = 256,
+        imagesize: int = 224,
+        split: DatasetSplit = DatasetSplit.TRAIN,
+        train_val_split: float = 1.0,
+        augment: bool = False,
+        classnames: Optional[List[str]] = None,
+        **_,
+    ) -> None:
         super().__init__()
+
         self.source = source
         self.split = split
-        self.classnames_to_use = [classname] if classname is not None else _CUSTOM_CLASSNAMES
         self.train_val_split = train_val_split
+        if classname is not None:
+            self.classnames_to_use = [classname]
+        elif classnames is not None:
+            self.classnames_to_use = classnames
+        else:
+            # Fallback for legacy behaviour when no explicit list is provided.
+            self.classnames_to_use = sorted(
+                [
+                    d
+                    for d in os.listdir(source)
+                    if os.path.isdir(os.path.join(source, d))
+                ]
+            )
 
         self.imgpaths_per_class, self.data_to_iterate = self.get_image_data()
 
-        self.transform_img = [
-            transforms.Resize(resize),
-            transforms.CenterCrop(imagesize),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
-        self.transform_img = transforms.Compose(self.transform_img)
+        self.transform_img = transforms.Compose(
+            [
+                transforms.Resize(resize),
+                transforms.CenterCrop(imagesize),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ]
+        )
+
+        self.transform_mask = transforms.Compose(
+            [
+                transforms.Resize(resize, interpolation=PIL.Image.NEAREST),
+                transforms.CenterCrop(imagesize),
+                transforms.ToTensor(),
+            ]
+        )
 
         self.imagesize = (3, imagesize, imagesize)
+        self.augment = augment and split == DatasetSplit.TRAIN
 
-    def __getitem__(self, idx):
-        # 计算原始图像索引和切片索引
+        if self.augment:
+            # Mild appearance jittering to reduce overfitting to illumination.
+            self.augment_img = transforms.Compose(
+                [
+                    transforms.ColorJitter(
+                        brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
+                    ),
+                    transforms.RandomApply(
+                        [transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))],
+                        p=0.2,
+                    ),
+                ]
+            )
+        else:
+            self.augment_img = None
+
+    def __getitem__(self, idx: int):
         orig_idx = idx // 2
-        slice_idx = idx % 2  # 0=左切片, 1=右切片
+        slice_idx = idx % 2
 
         classname, anomaly, image_path, mask_path = self.data_to_iterate[orig_idx]
         full_image = PIL.Image.open(image_path).convert("RGB")
 
-        # 定义两个切片的边界框
-        if slice_idx == 0:  # 左切片
-            bbox = (0, 0, 1024, 1024)
-        else:  # 右切片
-            bbox = (1024, 0, 2048, 1024)
+        tile = self._crop_tile(full_image, slice_idx)
+        if self.augment_img is not None:
+            tile = self.augment_img(tile)
 
-        # 裁剪图像
-        tile = full_image.crop(bbox)
         image = self.transform_img(tile)
 
-        # 处理掩码
         if self.split == DatasetSplit.TEST and mask_path is not None:
             full_mask = PIL.Image.open(mask_path)
-            mask = full_mask.crop(bbox)
-            mask = self.transform_mask(mask)
+            mask_tile = self._crop_tile(full_mask, slice_idx)
+            mask = self.transform_mask(mask_tile)
         else:
             mask = torch.zeros([1, *image.size()[1:]])
 
-        # 添加切片标识到图像名称
         slice_suffix = "_left" if slice_idx == 0 else "_right"
         image_name = "/".join(image_path.split("/")[-4:]) + slice_suffix
 
@@ -107,70 +133,60 @@ class CustomDataset(torch.utils.data.Dataset):
             "image_path": image_path,
         }
 
-        # return {
-        #     "image": image,
-        #     "mask": mask,
-        #     "classname": classname,
-        #     "anomaly": anomaly,
-        #     "is_anomaly": int(anomaly != "good"),
-        #     "image_name": "/".join(image_path.split("/")[-4:]),
-        #     "image_path": image_path,
-        # }
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data_to_iterate) * 2
 
-    def get_image_data(self):
+    @staticmethod
+    def _crop_tile(image: PIL.Image.Image, slice_idx: int) -> PIL.Image.Image:
+        width, height = image.size
+        midpoint = width // 2
+        if slice_idx == 0:
+            bbox = (0, 0, midpoint, height)
+        else:
+            bbox = (midpoint, 0, width, height)
+        return image.crop(bbox)
+
+    def get_image_data(self) -> Tuple[dict, List[List[Optional[str]]]]:
         imgpaths_per_class = {}
-        data_to_iterate = []
+        data_to_iterate: List[List[Optional[str]]] = []
 
         for classname in self.classnames_to_use:
             classpath = os.path.join(self.source, classname, self.split.value)
-
-            # 检查路径是否存在
             if not os.path.exists(classpath):
-                print(f"警告: 路径不存在 {classpath}")
                 continue
 
-            anomaly_types = os.listdir(classpath)
+            anomaly_types = sorted(
+                [
+                    anomaly
+                    for anomaly in os.listdir(classpath)
+                    if os.path.isdir(os.path.join(classpath, anomaly))
+                ]
+            )
             imgpaths_per_class[classname] = {}
 
             for anomaly in anomaly_types:
                 anomaly_path = os.path.join(classpath, anomaly)
+                anomaly_files = sorted(
+                    [
+                        os.path.join(anomaly_path, f)
+                        for f in os.listdir(anomaly_path)
+                        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+                    ]
+                )
 
-                # 跳过非目录的文件
-                if not os.path.isdir(anomaly_path):
-                    continue
-
-                anomaly_files = sorted([
-                    f for f in os.listdir(anomaly_path)
-                    if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-                ])
-
-                # 跳过空目录
                 if not anomaly_files:
-                    print(f"警告: 目录为空 {anomaly_path}")
                     continue
 
-                imgpaths_per_class[classname][anomaly] = [
-                    os.path.join(anomaly_path, f) for f in anomaly_files
-                ]
-
-                # 训练/验证分割
                 if self.train_val_split < 1.0:
-                    n_images = len(imgpaths_per_class[classname][anomaly])
-                    train_val_split_idx = int(n_images * self.train_val_split)
+                    split_idx = int(len(anomaly_files) * self.train_val_split)
                     if self.split == DatasetSplit.TRAIN:
-                        imgpaths_per_class[classname][anomaly] = imgpaths_per_class[
-                                                                     classname
-                                                                 ][anomaly][:train_val_split_idx]
+                        anomaly_files = anomaly_files[:split_idx]
                     elif self.split == DatasetSplit.VAL:
-                        imgpaths_per_class[classname][anomaly] = imgpaths_per_class[
-                                                                     classname
-                                                                 ][anomaly][train_val_split_idx:]
+                        anomaly_files = anomaly_files[split_idx:]
 
-                # 为每个图像创建数据项 (classname, anomaly, image_path, None)
-                for image_path in imgpaths_per_class[classname][anomaly]:
+                imgpaths_per_class[classname][anomaly] = anomaly_files
+
+                for image_path in anomaly_files:
                     data_to_iterate.append([classname, anomaly, image_path, None])
 
         return imgpaths_per_class, data_to_iterate
