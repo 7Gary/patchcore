@@ -21,6 +21,19 @@ class PatchCore(torch.nn.Module):
         """PatchCore anomaly detection class."""
         super(PatchCore, self).__init__()
         self.device = device
+        self.contamination_ratio = 0.0
+        self.contamination_topk_ratio = 0.1
+        self.target_false_positive = None
+        self.target_miss_rate = None
+        self.pseudo_anomaly_generator = None
+        self.pseudo_calibration_max_batches = 0
+        self.pseudo_samples_per_image = 1
+        self.pseudo_lower_percentile = 0.1
+        self.calibrated_threshold = None
+        self.last_filtered_indices = []
+        self.clean_score_distribution = []
+        self.pseudo_score_distribution = []
+        self.training_clean_threshold = None
 
     def load(
         self,
@@ -35,6 +48,14 @@ class PatchCore(torch.nn.Module):
         anomaly_score_num_nn=1,
         featuresampler=patchcore.sampler.IdentitySampler(),
         nn_method=patchcore.common.FaissNN(False, 4),
+        contamination_ratio=0.0,
+        contamination_topk_ratio=0.1,
+        target_false_positive=0.05,
+        target_miss_rate=0.05,
+        pseudo_anomaly_generator=None,
+        pseudo_calibration_max_batches=4,
+        pseudo_samples_per_image=1,
+        pseudo_lower_percentile=0.1,
         **kwargs,
     ):
         self.backbone = backbone.to(device)
@@ -75,6 +96,15 @@ class PatchCore(torch.nn.Module):
         )
 
         self.featuresampler = featuresampler
+        self.contamination_ratio = contamination_ratio
+        self.contamination_topk_ratio = contamination_topk_ratio
+        self.target_false_positive = target_false_positive
+        self.target_miss_rate = target_miss_rate
+        self.pseudo_anomaly_generator = pseudo_anomaly_generator
+        self.pseudo_calibration_max_batches = pseudo_calibration_max_batches
+        self.pseudo_samples_per_image = pseudo_samples_per_image
+        self.pseudo_lower_percentile = pseudo_lower_percentile
+        self.calibrated_threshold = None
 
     def embed(self, data):
         if isinstance(data, torch.utils.data.DataLoader):
@@ -153,27 +183,156 @@ class PatchCore(torch.nn.Module):
         self._fill_memory_bank(training_data)
 
     def _fill_memory_bank(self, input_data):
-        """Computes and sets the support features for SPADE."""
+        """Computes and sets the support features for SPADE with noise filtering."""
         _ = self.forward_modules.eval()
 
         def _image_to_features(input_image):
             with torch.no_grad():
                 input_image = input_image.to(torch.float).to(self.device)
-                return self._embed(input_image)
+                features, patch_shapes = self._embed(
+                    input_image, provide_patch_shapes=True
+                )
+            features = np.asarray(features)
+            batchsize = input_image.shape[0]
+            num_patches = patch_shapes[0][0] * patch_shapes[0][1]
+            return features.reshape(batchsize, num_patches, -1)
 
-        features = []
+        image_features = []
         with tqdm.tqdm(
             input_data, desc="Computing support features...", position=1, leave=False
         ) as data_iterator:
-            for image in data_iterator:
-                if isinstance(image, dict):
-                    image = image["image"]
-                features.append(_image_to_features(image))
+            for batch in data_iterator:
+                if isinstance(batch, dict):
+                    batch = batch["image"]
+                batch_features = _image_to_features(batch)
+                image_features.extend([np.copy(feat) for feat in batch_features])
 
-        features = np.concatenate(features, axis=0)
+        (
+            filtered_features,
+            filtered_indices,
+            per_image_scores,
+            contamination_threshold,
+        ) = self._filter_contaminated_embeddings(image_features)
+
+        self.last_filtered_indices = filtered_indices
+        self.clean_score_distribution = per_image_scores
+        self.training_clean_threshold = contamination_threshold
+
+        features = np.concatenate(filtered_features, axis=0)
         features = self.featuresampler.run(features)
 
         self.anomaly_scorer.fit(detection_features=[features])
+
+        if (
+            self.pseudo_anomaly_generator is not None
+            and self.pseudo_calibration_max_batches > 0
+        ):
+            self._calibrate_with_pseudo_anomalies(input_data)
+
+    def _filter_contaminated_embeddings(self, image_features):
+        """Filter noisy supports similar to Pseudo Multi-View Dual-Teacher (CVPR'23)."""
+        if not image_features:
+            return image_features, [], [], None
+
+        if self.contamination_ratio <= 0:
+            return image_features, [], [0.0 for _ in image_features], None
+
+        stacked = np.concatenate(image_features, axis=0)
+        feature_mean = np.mean(stacked, axis=0, keepdims=True)
+        patch_scores = np.linalg.norm(stacked - feature_mean, axis=1)
+
+        per_image_scores = []
+        filtered_features = []
+        filtered_indices = []
+
+        start_idx = 0
+        for idx, feats in enumerate(image_features):
+            end_idx = start_idx + len(feats)
+            image_patch_scores = patch_scores[start_idx:end_idx]
+            start_idx = end_idx
+            topk = max(1, int(np.ceil(len(image_patch_scores) * self.contamination_topk_ratio)))
+            top_scores = np.partition(image_patch_scores, -topk)[-topk:]
+            per_image_scores.append(float(np.mean(top_scores)))
+
+        contamination_threshold = float(
+            np.quantile(per_image_scores, 1 - self.contamination_ratio)
+        )
+
+        for idx, (feats, score) in enumerate(zip(image_features, per_image_scores)):
+            if score <= contamination_threshold or len(filtered_features) == 0:
+                filtered_features.append(feats)
+            else:
+                filtered_indices.append(idx)
+
+        if not filtered_features:
+            filtered_features = image_features
+            filtered_indices = []
+
+        if filtered_indices:
+            LOGGER.info(
+                "Filtered %d/%d suspected anomalous training tiles (threshold=%.4f).",
+                len(filtered_indices),
+                len(image_features),
+                contamination_threshold,
+            )
+
+        return filtered_features, filtered_indices, per_image_scores, contamination_threshold
+
+    def _calibrate_with_pseudo_anomalies(self, dataloader):
+        """Calibrate thresholds using CutPaste pseudo anomalies (CVPR'21)."""
+        clean_scores = []
+        pseudo_scores = []
+        batches_processed = 0
+
+        for batch in dataloader:
+            if isinstance(batch, dict):
+                images = batch["image"]
+            else:
+                images = batch
+
+            with torch.no_grad():
+                clean_batch_scores, _ = self._predict(images)
+
+            pseudo_images = self._generate_pseudo_batch(images)
+            with torch.no_grad():
+                pseudo_batch_scores, _ = self._predict(pseudo_images)
+
+            clean_scores.extend(clean_batch_scores)
+            pseudo_scores.extend(pseudo_batch_scores)
+
+            batches_processed += 1
+            if batches_processed >= self.pseudo_calibration_max_batches:
+                break
+
+        if not clean_scores or not pseudo_scores:
+            return
+
+        target_miss = self.target_miss_rate if self.target_miss_rate is not None else 0.05
+        upper_clean = float(np.percentile(clean_scores, (1 - target_miss) * 100))
+        lower_pseudo = float(
+            np.percentile(pseudo_scores, self.pseudo_lower_percentile * 100)
+        )
+
+        self.calibrated_threshold = max(upper_clean, (upper_clean + lower_pseudo) / 2.0)
+        self.clean_score_distribution = clean_scores
+        self.pseudo_score_distribution = pseudo_scores
+
+        LOGGER.info(
+            "Calibrated decision threshold at %.4f using %d pseudo batches.",
+            self.calibrated_threshold,
+            batches_processed,
+        )
+
+    def _generate_pseudo_batch(self, images):
+        pseudo_images = []
+        for image in images:
+            pseudo_image = image.detach().cpu()
+            for _ in range(max(1, self.pseudo_samples_per_image)):
+                pseudo_image, _ = self.pseudo_anomaly_generator(pseudo_image)
+            pseudo_images.append(pseudo_image)
+
+        pseudo_batch = torch.stack(pseudo_images, dim=0).to(images.device)
+        return pseudo_batch.to(dtype=images.dtype)
 
     def predict(self, data):
         if isinstance(data, torch.utils.data.DataLoader):
