@@ -7,7 +7,7 @@ from torchvision import transforms
 
 # 自定义数据集类名（根据您的实际数据集修改）
 _CUSTOM_CLASSNAMES = [
-    "user3",
+    "bupi",
     # 添加您的自定义类别
 ]
 
@@ -172,6 +172,5 @@ class CustomDataset(torch.utils.data.Dataset):
                 # 为每个图像创建数据项 (classname, anomaly, image_path, None)
                 for image_path in imgpaths_per_class[classname][anomaly]:
                     data_to_iterate.append([classname, anomaly, image_path, None])
-
 
         return imgpaths_per_class, data_to_iterate
